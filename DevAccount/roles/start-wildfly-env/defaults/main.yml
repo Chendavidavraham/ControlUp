@@ -1,0 +1,8 @@
+---
+# defaults file for start wildfly env
+action: "start"
+ec2_region: "{{ region }}"
+reuse_existing_ip_allowed: yes
+release_on_disassociation: yes
+earnix_version_clone: 1.0.unknown
+cloud_webui: false

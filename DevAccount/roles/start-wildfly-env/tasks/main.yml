@@ -1,0 +1,9 @@
+---
+# tasks file for start_stop_ec2
+
+- name: start / stop rds and wait
+  include: start_rds.yml
+
+- name: Start / stop  env instances and wait
+  include: start_instances.yml
+

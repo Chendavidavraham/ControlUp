@@ -1,0 +1,196 @@
+---
+- name: Wait until RDS is available or stopped
+  local_action:
+    module: rds
+    command: facts
+    region: "{{ region }}"
+    instance_name: "{{ rds_name }}"
+  register: rds_facts1
+  until: rds_facts1['instance'] is not defined or rds_facts1['instance']['status'] == 'available' 
+  retries: 60
+  delay: 40
+  ignore_errors: yes
+- debug:
+    msg: "RDS status is {{ rds_facts1['instance']['status'] }}"
+  when: rds_facts1['instance'] is defined
+  
+- name: set short version fact
+  set_fact: 
+     earnix_short_version: "{{ earnix_version_clone.split('.')[0] }}.{{ earnix_version_clone.split('.')[1] }}"
+- debug:
+    msg: "Earnix short version is  {{ earnix_short_version }}"
+    
+- name: set postgres facts for v12.x
+  set_fact:
+    db_parameter_group: "{{ postgres_parameter_group | default('default.postgres12') }}"
+    db_option_group: "{{ postgres_option_group | default('default:postgres-12') }}"
+    license_model: postgresql-license
+    db_engine: postgres
+    engine_version: "{{ 12.3 }}"
+  when: db_vendor == "postgresql" and earnix_short_version is version('10.04', '>=')
+  
+- name: set postgres facts for v10.x
+  set_fact:
+    db_parameter_group: "{{ postgres_parameter_group | default('default.postgres10') }}"
+    db_option_group: "{{ postgres_option_group | default('default:postgres-10') }}"
+    license_model: postgresql-license
+    db_engine: postgres
+    engine_version: "{{ 10.9 }}"
+  when: db_vendor == "postgresql" and earnix_short_version is version('10.03', '<=')
+
+- name: set oracle db snapshot facts
+  set_fact:
+    db_parameter_group: "{{ oracle_parameter_group }}"
+    db_option_group: "{{ oracle_option_group }}"
+    engine_version: "{{ oracle_engine_version }}"
+  when: db_vendor == "oracle"
+
+- name: Restore new RDS from snapshot
+  rds:
+    command: restore 
+    instance_name: "{{ rds_name }}" 
+    snapshot: "{{ rds_name }}-final-snapshot"
+    subnet: "{{ db_subnet }}" 
+    db_engine: "{{ db_engine }}"
+    instance_type: "{{ rds_instance_class }}"
+    license_model: "{{ license_model }}" 
+    multi_zone: no
+    publicly_accessible: no
+    region: "{{ region }}"
+#    zone: "{{ availability_zone }}"
+    wait: yes
+    wait_timeout: 1400
+    tags: 
+      EnvironmentName: "{{ env_name }}"
+      Name: "{{ env_name }}"
+      Customer: Earnix
+      Region: "{{ region }}"
+      Environment: "{{ tag_environment }}"
+      Type: AWS-RDS-RDS
+  when: state == "running"
+
+- name: getting rds instance facts
+  rds_instance_facts:
+    db_instance_identifier: "{{ rds_name }}"
+    region: "{{ region }}"
+  register: database_facts
+  when: state == "running"
+
+- debug: 
+    msg: "rds version is {{ database_facts['instances'][0]['engine_version'] }}"
+  when: state == "running"
+    
+- name: intermediate DB upgrade if needed
+  block:
+    - name: Modify RDS  to intermediate version
+      rds_instance:
+        state: present
+        db_instance_identifier: "{{ rds_name }}"
+        engine_version: "10.13"
+        region: "{{ region }}"
+        apply_immediately: yes
+        wait: yes
+        
+    - name: Wait till rds facts are available for the modified instance
+      pause:
+        minutes: 1
+
+    - name: Wait until new RDS is available
+      local_action:
+        module: rds
+        command: facts
+        region: "{{ region }}"
+        instance_name: "{{ rds_name }}"
+      register: rds_facts
+      until: rds_facts['instance']['status'] == 'available'
+      retries: 300
+      delay: 60
+
+    - name: rds status after modifying to intermediate version
+      debug:
+        msg: "{{ rds_facts['instance']['status'] }}"
+  when: state == "running" and db_vendor == "postgresql" and database_facts['instances'][0]['engine_version'] is version('10.12', '<=') and earnix_short_version is version('10.04', '>=') and ( modify_db_on_start is not defined or modify_db_on_start != false )
+  
+
+
+- name: Modify RDS with missing parameters that can't be added at restore time
+  rds_instance:
+    state: present
+    allow_major_version_upgrade: yes
+    db_instance_identifier: "{{ rds_name }}"
+    engine_version: "{{ engine_version }}"
+    option_group_name: "{{ db_option_group }}"
+    db_parameter_group_name: "{{ db_parameter_group }}"
+    vpc_security_group_ids: "{{ db_security_groups }}"
+    region: "{{ region }}"
+    backup_retention_period: 0
+    preferred_maintenance_window: "{{ db_maint_window }}"
+    preferred_backup_window: "{{ db_backup_window }}"
+    apply_immediately: yes
+    wait: yes
+  when: state == "running" and ( modify_db_on_start is not defined or modify_db_on_start != false ) 
+
+- pause:
+    minutes: 1
+  
+
+- name: Wait until RDS is available after modify 
+  local_action:
+    module: rds
+    command: facts
+    region: "{{ region }}"
+    instance_name: "{{ rds_name }}"
+  register: rds_facts
+  until: rds_facts['instance']['status'] == 'available' 
+  retries: 70
+  delay: 30
+  when: state == "running"
+   
+- name: Restart RDS after Modify 
+  rds:
+    command: reboot
+    instance_name: "{{ rds_name }}"
+    region: "{{ region }}"
+    wait: yes
+    wait_timeout: 450
+  when: state == "running" and ( modify_db_on_start is not defined or modify_db_on_start != false )
+
+- name: Wait until RDS is available
+  local_action:
+    module: rds
+    command: facts
+    region: "{{ region }}"
+    instance_name: "{{ rds_name }}"
+  register: rds_facts
+  until: rds_facts['instance']['status'] == 'available'
+  retries: 60
+  delay: 40
+  when: state == "running"
+
+- debug:
+    msg: "{{ rds_facts['instance']['status'] }}"
+  when: state == "running"
+
+- debug:
+    msg: "{{ rds_facts.instance.endpoint }}"
+  when: state == "running"
+
+- name: delete previous rds final snapshot
+  #shell: "aws rds delete-db-snapshot --db-snapshot-identifier {{ rds_name }}-final-snapshot --region {{ region }} "
+  shell: "~centos/.local/bin/aws rds delete-db-snapshot --db-snapshot-identifier {{ rds_name }}-final-snapshot --region {{ region }} "
+  args:
+    executable: /bin/bash
+  ignore_errors: yes
+  when: state == "stopped" and rds_facts1['instance'] is defined and rds_facts1['instance']['status'] == 'available'
+
+- name: delete rds and Create snapshot
+  rds:
+    command: delete
+    instance_name: "{{ rds_name }}"
+    snapshot: "{{ rds_name }}-final-snapshot"
+    wait: yes
+    wait_timeout: 2500
+    region: "{{ region }}"
+  async: 2800
+  poll: 10
+  when: state == "stopped" and rds_facts1['instance'] is defined and rds_facts1['instance']['status'] == 'available'

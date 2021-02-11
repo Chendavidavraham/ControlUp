@@ -1,0 +1,100 @@
+---
+- hosts: localhost
+  roles:
+  - {role: ../roles/start-wildfly-env}
+  vars_files:
+    - "vars/infra_dev.yml"
+    - "vars/{{ region }}.yml"
+    - "group_vars/tag_EnvironmentName_{{ env_name }}/env.yml"
+
+- name: refresh inventory
+  hosts: localhost
+  connection: local
+  gather_facts: False
+  tasks:
+    - name: Refresh EC2 cache
+      command: ../ec2.py --refresh-cache
+#      when: state == "running"
+    - name: Refresh in-memory EC2 cache
+      meta: refresh_inventory
+#      when: state == "running"
+
+- name: wait till analytical is healthy
+  hosts: "tag_EnvironmentName_{{ env_name }}:&tag_Type_Analytical"
+  tasks:
+    - name: inspect docker and wait till it's healthy
+      block:
+        - shell: "docker inspect --format='{{'{{.State.Health.Status}}'}}' Analytical"
+          register: analytical_health
+          until: analytical_health['stdout'] == 'healthy'
+          retries: 60
+          delay: 5
+        - debug:
+            msg: "Analytical is {{ analytical_health['stdout'] }} after startup"
+      when: ( state == "running" and upgrade is not defined )
+
+- name: Restart Agents after Analytical is up
+  hosts: "tag_Type_Agent:tag_Type_AgentPP:&tag_EnvironmentName_{{ env_name }}"
+  tasks:
+    - name: "restart {{ container_name }}"
+      block:
+        - command: "docker restart {{ container_name }}"
+          when: state == "running"
+          ignore_errors: True
+      when: ( state == "running" and upgrade is not defined )
+
+- name: Restart Agent on Analytical after Analytical is up
+  hosts: "tag_EnvironmentName_{{ env_name }}:&tag_Type_Analytical"
+  tasks:
+    - name: restart agents
+      block:
+        - command: docker restart Agent
+          when: ( state == "running" and internal_agent == true and upgrade is not defined)
+          ignore_errors: True
+
+        - name: stop agent++ container
+          docker_container:
+            name: AgentPP
+            state: stopped 
+          ignore_errors: True
+      when: ( state == "running" and internal_agent == true and upgrade is not defined)
+- name: create /var/log/journal to enable mount logging for debugging Amazon CASE 5320612081
+  hosts: "tag_EnvironmentName_{{ env_name }}:&tag_Type_Analytical"
+  tasks:
+    - name: create /var/log/journal to enable mount logging for debugging Amazon CASE 5320612081
+      file:
+        path: /var/log/journal
+        state: directory
+        mode: 0644
+      become: true
+      
+- name: delete online folder in onlines and analytical
+  hosts: "tag_Type_Analytical:tag_Type_Online:&tag_EnvironmentName_{{ env_name }}"
+  tasks:
+    - name: delete online folder in onlines and analytical
+      block:
+        - name: stop container
+          docker_container:
+            name: "{{ container_name }}"
+            state: stopped
+
+        - name: Delete Earnix/data/online dir so online upgrade will succeed
+          file:
+            path: "{{ item }}"
+            state: absent
+          become: true
+          loop:
+            - "/opt/{{ folder_name }}/Earnix/data/online"
+            - "/opt/{{ folder_name }}/Earnix/data/sqlite"
+
+        # - name: Delete Earnix/data/sqlite dir so online upgrade will succeed
+        #   file:
+        #     path: "/opt/{{ folder_name }}/Earnix/data/sqlite"
+        #     state: absent
+        #   become: true
+
+        - name: start online/analytical container after online folder cleanup
+          docker_container:
+            name: "{{ container_name }}"
+            state: started 
+      when: clean_onlines is defined and clean_onlines|bool==true

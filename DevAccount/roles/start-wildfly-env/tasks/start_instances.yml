@@ -1,0 +1,181 @@
+---
+- name: "Get the environment ec2 Spot instances"
+  ec2_instance_facts:
+    filters:
+      "tag:EnvironmentName": "{{ env_name }}"
+      "tag:Spot": "True"
+      "instance-state-name": running
+    region: "{{ region }}"
+  register: instances_facts
+  when: state == "stopped"
+- debug:
+    msg: "{{ instances_facts }}"
+
+- name: "Get Spotinst stateful IDs"
+  uri:
+    url: "https://api.spotinst.io/aws/ec2/group/{{ item['tags']['spotinst:aws:ec2:group:id'] }}/statefulInstance?accountId={{ spotinst_account }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ spotinst_token }}"
+  register: spotinst_ssids
+  with_items: "{{ instances_facts.instances }}"
+  when: state == "stopped"
+- debug:
+      msg: "{{ spotinst_ssids }}"
+
+- name: "Change the state of all the environment ec2 Spot instances to stopped"
+  uri:
+    url: "https://api.spotinst.io/aws/ec2/group/{{ item['item']['tags']['spotinst:aws:ec2:group:id'] }}/statefulInstance/{{ item['json']['response']['items'][0]['id'] }}/pause?accountId={{ spotinst_account }}"
+    method: PUT
+    headers:
+      Authorization: "Bearer {{ spotinst_token }}"
+  register: spotinst_request
+  with_items: "{{ spotinst_ssids.results }}"
+  when: state == "stopped"
+- debug:
+      msg: "{{ spotinst_request }}"
+
+- name: Wait for ec2 Spot instances to stop
+  uri:
+    url: "https://api.spotinst.io/aws/ec2/group/{{ item['tags']['spotinst:aws:ec2:group:id'] }}/statefulInstance?accountId={{ spotinst_account }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ spotinst_token }}"
+  register: spotinst_status
+  until: "{{ spotinst_status['json']['response']['items'][0]['state'] == 'PAUSED' }}"
+  with_items: "{{ instances_facts.instances }}"
+  retries: 60
+  delay: 10
+  when: state == "stopped"
+  become: yes
+
+- name: "Get the environment ec2 non-Spot instances"
+  ec2_instance_facts:
+    filters:
+      "tag:EnvironmentName": "{{ env_name }}"
+      "tag:Spot": "False"
+    region: "{{ region }}"
+  register: instances_facts_last_change
+- debug:
+    msg: "{{ instances_facts_last_change }}"
+
+- name: "Ansible date fact"
+  set_fact:
+    LastChangeNewDate="{{ ansible_date_time.day }}-{{ ansible_date_time.month }}-{{ ansible_date_time.year }}"
+- debug:
+      msg: "{{ LastChangeNewDate }}"
+
+- name: Change the LastChange tag of the Env tag
+  ec2_tag:
+    resource: "{{ item }}"
+    region: "{{ region }}"
+    tags:
+      LastChange: "{{ LastChangeNewDate }}"
+    state: present
+  with_items: "{{ instances_facts_last_change.instances|map(attribute='instance_id')|list|unique }}"
+
+- name: "change the state of all the environment ec2 non-Spot instances to stopped"
+  local_action:
+    module: ec2
+    region: "{{ region }}"
+    instance_tags:
+      EnvironmentName: "{{ env_name }}"
+      Spot: "False"
+    state: "{{ state }}"
+    wait: yes
+  register: stopped_instances
+  when: state == "stopped"
+
+- name: "Change the state of all the environment ec2 Spot instances to running"
+  local_action: command python ../roles/start-wildfly-env/files/start-env-wildfly-spots.py {{ spotinst_account }} {{ spotinst_token }} {{ env_name }} {{ start_agents }} {{ start_onlines }}
+  register: spot_startup
+  when: state == "running"
+- debug:
+    msg: "{{ spot_startup }}"
+
+- name: "change the state of the analytical server to {{ state }}"
+  local_action:
+    module: ec2
+    region: "{{ region }}"
+    instance_tags:
+      EnvironmentName: "{{ env_name }}"
+      Type: Analytical
+      Spot: "False"
+    state: "{{ state }}"
+    wait: yes
+  when: state == "running"
+
+- name: "change the state of the onlines to {{ state }}"
+  local_action:
+    module: ec2
+    region: "{{ region }}"
+    instance_tags:
+      EnvironmentName: "{{ env_name }}"
+      Type: Online
+      Spot: "False"
+    state: "{{ state }}"
+    wait: yes
+  when: state == "running" and start_onlines is defined and start_onlines|bool==true
+
+- name: "change the state of the agents to {{ state }}"
+  local_action:
+    module: ec2
+    region: "{{ region }}"
+    instance_tags:
+      EnvironmentName: "{{ env_name }}"
+      Type: Agent*
+      Spot: "False"
+    state: "{{ state }}"
+    wait: yes
+  when: state == "running" and start_agents is defined and start_agents|bool==true
+
+- name: wait to let analytical start
+  pause:
+    seconds: 60
+  when: ( state == "running" and upgrade is not defined )
+
+- name: gather analytical facts
+  ec2_instance_facts:
+    filters:
+      "tag:EnvironmentName": "{{ env_name }}"
+      "tag:Type": Analytical
+      "instance-state-name": running
+    region: "{{ region }}"
+  register: analytical_facts
+  when: state == "running"
+
+- name: Analytical instance id
+  debug:
+    msg: "{{ analytical_facts['instances'][0]['instance_id'] }}"
+  when: state == "running"
+
+- name: add Analytical to ALB if cloud webui is defined
+  elb_target:
+    target_group_name: "{{ env_name | regex_replace('_','-') | lower }}-TG"
+    target_id: "{{ analytical_facts['instances'][0]['instance_id'] }}"
+    region: "{{ region }}"
+    state: present
+  when: cloud_webui and state == "running"
+
+- name: Wait for Analytical port 22 to become open
+  wait_for:
+    port: 22
+    host: "{{ analytical_facts['instances'][0]['private_ip_address'] }}"
+    timeout: 800
+    delay: 1
+  connection: local
+  when: ( state == "running" )
+
+- name: Wait for Analytical port 8080 to become open
+  wait_for:
+    port: 8080
+    host: "{{ analytical_facts['instances'][0]['private_ip_address'] }}"
+    timeout: 800
+    delay: 1
+  connection: local
+  when: ( state == "running" and upgrade is not defined )
+
+- name: wait to let analytical start
+  pause:
+    seconds: 120 
+  when: ( state == "running" and upgrade is not defined )
